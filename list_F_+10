@@ -1,0 +1,4 @@
+#!/bin/bash
+
+echo "Files > 10MB in $(pwd):"
+find . -maxdepth 5 -type f -size +10M -ls
