@@ -1,0 +1,14 @@
+#!/bin/bash
+
+#This script creates makes a logfile and prints out which files were deleted and creates a time steamp of it
+# This script deletes files older than 15 days old, note that this can also be used as a cron job
+
+
+DIRECTORY="/path/to/directory"
+LOGFILE="/var/log/file_clean.log"
+
+echo "Cleanup started at $(date)" >> $LOGFULE
+
+find "$DIRECTORY" -type f -mtime +15 -print -exec rm -rf {} \; >> $LOGFILE
+
+echo " Cleanup completed at $(date)" >> $LOGFILE

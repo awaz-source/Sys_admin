@@ -1,0 +1,7 @@
+#!/bin/bash
+
+#Variable DIRECTORY is created, replace directory with the one you want
+DIRECTORY="/path/to/directory"
+
+# Finds files older than 15 days old within that directory variable and prints to screen
+find "$DIRECTORY" -type f -mtime +15
