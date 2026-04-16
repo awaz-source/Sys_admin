@@ -1,0 +1,14 @@
+#!/bin/bash
+
+SEARCH_DIR="."
+
+
+echo "Searching for files larger than 10MB in $SEARCH_DIR ..."
+LARGE_FILES=$(find "$SEARCH_DIR" -type f -size +10M)
+
+if [[ -z "$LARGE_FILES ]]; then
+    echo "No files larger than 10MB were found
+else
+    echo "Files larger than 10MB:"
+    echo "$LARGE_FILES"
+fi

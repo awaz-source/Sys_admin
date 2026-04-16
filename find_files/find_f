@@ -1,0 +1,11 @@
+#!/bin/bash
+
+
+#This creates a variable called Directory which we will use to check for.Substitute this directory with the directory you wish to check
+Directory="/path/to/directory"
+
+# "find" command searches inside the directory variable 
+# "-type f" only searches for files not directories
+# "-mtime +15" specifices files that were modified more than 15 days ago
+# "exec rm -f {} \;" runs the commands, forcibly deletes the file
+find "$Directory" -type f -mtime +15 -exec rm -f {} \;

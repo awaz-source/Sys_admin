@@ -1,0 +1,5 @@
+#!/bin/bash
+
+Directory="/home/killua/interview"
+
+find "$Directory" -type f -mtime +7 -print -delete
