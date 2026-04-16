@@ -1,0 +1,35 @@
+#!/bin/bash
+
+directory="$1"
+old_files=$(find "$directory" -type f -mtime +120")
+
+
+if [ ! -d "$directory" ]
+then
+     echo " Directory does not exist"
+     exit 1
+
+fi
+
+echo " Searching for files ....."
+
+if [ -z "$old_files" ]
+then 
+    echo "No old files found:
+    exit 0
+fi
+
+echo " Old files are as follows:"
+echo "$old_files"
+
+echo " Do you want to delete these files? (yes/no)"
+read answer
+
+if [ "$answer" = "yes" ]
+then
+     echo "Deleting files..."
+     "$old_files -delete"
+     echo "Files are deleted"
+else
+     echo "No files deleted"
+fi
