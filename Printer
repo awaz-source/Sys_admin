@@ -1,0 +1,81 @@
+#!/bin/bash
+
+echo "====================================="
+echo " Printer Health Check"
+echo "====================================="
+echo "Hostname: $(hostname)"
+echo "Date: $(date)"
+echo
+
+######################################
+# CUPS Status
+######################################
+
+echo "CUPS Service"
+
+if systemctl is-active --quiet cups
+then
+    echo "[OK] Running"
+else
+    echo "[FAIL] Stopped"
+fi
+
+echo
+
+######################################
+# Installed Printers
+######################################
+
+echo "Installed Printers"
+
+lpstat -p
+
+echo
+
+######################################
+# Default Printer
+######################################
+
+echo "Default Printer"
+
+lpstat -d
+
+echo
+
+######################################
+# Queue
+######################################
+
+echo "Queued Jobs"
+
+lpstat -o
+
+echo
+
+######################################
+# Disk Space
+######################################
+
+echo "Disk Usage"
+
+df -h /
+
+echo
+
+######################################
+# Recent Errors
+######################################
+
+journalctl -u cups --since "24 hours ago" | tail -20
+
+#!/bin/bash
+
+echo "Restarting CUPS..."
+
+sudo systemctl restart cups
+
+echo "Clearing Queue..."
+
+cancel -a
+
+echo "Done."
