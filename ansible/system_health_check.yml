@@ -1,0 +1,75 @@
+---
+# Read-only Linux health check for Ansible-managed hosts.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini ansible/system_health_check.yml
+#   ansible-playbook -i inventory.ini ansible/system_health_check.yml --limit webservers
+#
+# The remote account needs permission to run systemctl. The playbook does not
+# change host configuration and continues when a diagnostic command is absent.
+
+- name: Collect a Linux system health report
+  hosts: all
+  gather_facts: true
+  become: false
+
+  tasks:
+    - name: Read system uptime and load averages
+      ansible.builtin.command:
+        argv:
+          - uptime
+      register: health_uptime
+      changed_when: false
+      failed_when: false
+
+    - name: Read filesystem usage
+      ansible.builtin.command:
+        argv:
+          - df
+          - -hP
+          - -x
+          - tmpfs
+          - -x
+          - devtmpfs
+      register: health_filesystems
+      changed_when: false
+      failed_when: false
+
+    - name: Read memory usage
+      ansible.builtin.command:
+        argv:
+          - free
+          - -h
+      register: health_memory
+      changed_when: false
+      failed_when: false
+
+    - name: Find failed systemd units
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - --failed
+          - --no-legend
+          - --no-pager
+      register: health_failed_units
+      changed_when: false
+      failed_when: false
+
+    - name: Display the health report
+      ansible.builtin.debug:
+        msg: |
+          Host: {{ inventory_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Kernel: {{ ansible_kernel }}
+
+          Uptime:
+          {{ health_uptime.stdout | default('Unavailable', true) }}
+
+          Filesystems:
+          {{ health_filesystems.stdout | default('Unavailable', true) }}
+
+          Memory:
+          {{ health_memory.stdout | default('Unavailable', true) }}
+
+          Failed systemd units:
+          {{ health_failed_units.stdout | default('None', true) }}
