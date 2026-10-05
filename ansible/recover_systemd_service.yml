@@ -1,0 +1,108 @@
+---
+# Start a failed systemd service and verify that it recovered.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini ansible/recover_systemd_service.yml \
+#     -e managed_service=nginx
+#
+# Optional rolling batch size:
+#   ansible-playbook -i inventory.ini ansible/recover_systemd_service.yml \
+#     -e managed_service=nginx -e recovery_serial=2
+#
+# The playbook changes a host only when the selected service is inactive.
+# Run it against systems you administer and review the service name first.
+
+- name: Recover an inactive systemd service
+  hosts: all
+  become: true
+  gather_facts: false
+  serial: "{{ recovery_serial | default(1) }}"
+
+  pre_tasks:
+    - name: Validate the required service name
+      ansible.builtin.assert:
+        that:
+          - managed_service is defined
+          - managed_service | length > 0
+          - managed_service is match('^[A-Za-z0-9_.@-]+$')
+        fail_msg: >-
+          Set managed_service to one systemd unit name, for example
+          -e managed_service=nginx.
+
+  tasks:
+    - name: Check the current service state
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ managed_service }}"
+      register: service_state_before
+      changed_when: false
+      failed_when: false
+
+    - name: Report an already healthy service
+      ansible.builtin.debug:
+        msg: "{{ managed_service }} is already active on {{ inventory_hostname }}."
+      when: service_state_before.rc == 0
+
+    - name: Recover and verify an inactive service
+      when: service_state_before.rc != 0
+      block:
+        - name: Start the inactive service
+          ansible.builtin.systemd:
+            name: "{{ managed_service }}"
+            state: started
+
+        - name: Wait for the service to become active
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - is-active
+              - "{{ managed_service }}"
+          register: service_state_after
+          changed_when: false
+          failed_when: false
+          retries: 3
+          delay: 2
+          until: service_state_after.rc == 0
+
+        - name: Confirm successful recovery
+          ansible.builtin.assert:
+            that:
+              - service_state_after.rc == 0
+              - service_state_after.stdout == "active"
+            success_msg: >-
+              {{ managed_service }} recovered successfully on
+              {{ inventory_hostname }}.
+            fail_msg: >-
+              {{ managed_service }} did not reach the active state on
+              {{ inventory_hostname }}.
+
+      rescue:
+        - name: Collect recent service logs after recovery failure
+          ansible.builtin.command:
+            argv:
+              - journalctl
+              - --unit
+              - "{{ managed_service }}"
+              - --lines
+              - "30"
+              - --no-pager
+          register: recovery_journal
+          changed_when: false
+          failed_when: false
+
+        - name: Display recovery diagnostics
+          ansible.builtin.debug:
+            msg: |
+              Service: {{ managed_service }}
+              Host: {{ inventory_hostname }}
+              Previous state: {{ service_state_before.stdout | default('unknown', true) }}
+              Recent journal:
+              {{ recovery_journal.stdout | default('No journal output available.', true) }}
+
+        - name: Mark the host recovery as failed
+          ansible.builtin.fail:
+            msg: >-
+              Failed to recover {{ managed_service }} on
+              {{ inventory_hostname }}. Review the diagnostic output above.
