@@ -1,0 +1,160 @@
+---
+# Safely apply Linux package updates one host at a time.
+#
+# Dry-run first:
+#   ansible-playbook -i inventory rolling_linux_patch.yml --check \
+#     -e confirm_patch=true
+#
+# Apply updates without automatic reboot:
+#   ansible-playbook -i inventory rolling_linux_patch.yml \
+#     -e confirm_patch=true
+#
+# Apply updates, reboot only when the OS reports it is required, and verify
+# important services afterward:
+#   ansible-playbook -i inventory rolling_linux_patch.yml \
+#     -e confirm_patch=true -e reboot_after_patch=true \
+#     -e '{"verify_services":["sshd.service","nginx.service"]}'
+#
+# Supported OS families: Debian and RedHat. Use --limit to select a maintenance
+# group. The play runs serially and stops on the first failed host.
+
+- name: Patch Linux servers with validation
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    confirm_patch: false
+    reboot_after_patch: false
+    minimum_root_free_mb: 1024
+    reboot_timeout_seconds: 900
+    verify_services: []
+
+  pre_tasks:
+    - name: Require explicit patch confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_patch | bool
+        fail_msg: >-
+          Patching is disabled. Re-run with -e confirm_patch=true after
+          reviewing the target inventory and maintenance window.
+
+    - name: Confirm the operating system family is supported
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family in ['Debian', 'RedHat']
+        fail_msg: "Unsupported OS family: {{ ansible_os_family }}"
+
+    - name: Read available space on the root filesystem
+      ansible.builtin.command:
+        argv:
+          - df
+          - -Pm
+          - /
+      register: root_disk
+      changed_when: false
+      check_mode: false
+
+    - name: Calculate root filesystem free space
+      ansible.builtin.set_fact:
+        root_free_mb: "{{ root_disk.stdout_lines[-1].split()[3] | int }}"
+
+    - name: Require sufficient free space before patching
+      ansible.builtin.assert:
+        that:
+          - root_free_mb | int >= minimum_root_free_mb | int
+        fail_msg: >-
+          Only {{ root_free_mb }} MB is free on /. At least
+          {{ minimum_root_free_mb }} MB is required.
+
+    - name: Capture pre-patch boot identifier
+      ansible.builtin.command: cat /proc/sys/kernel/random/boot_id
+      register: boot_id_before
+      changed_when: false
+      check_mode: false
+
+  tasks:
+    - name: Update package cache and installed packages on Debian family
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        upgrade: dist
+      register: debian_patch
+      when: ansible_os_family == 'Debian'
+
+    - name: Update installed packages on RedHat family
+      ansible.builtin.dnf:
+        name: '*'
+        state: latest
+        update_cache: true
+      register: redhat_patch
+      when: ansible_os_family == 'RedHat'
+
+    - name: Check Debian reboot-required marker
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: debian_reboot_marker
+      when: ansible_os_family == 'Debian'
+
+    - name: Ask RedHat needs-restarting whether a reboot is required
+      ansible.builtin.command: needs-restarting -r
+      register: redhat_reboot_check
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == 'RedHat'
+
+    - name: Determine whether this host requires a reboot
+      ansible.builtin.set_fact:
+        reboot_required: >-
+          {{
+            (ansible_os_family == 'Debian' and
+             debian_reboot_marker.stat.exists | default(false)) or
+            (ansible_os_family == 'RedHat' and
+             redhat_reboot_check.rc | default(0) == 1)
+          }}
+
+    - name: Reboot when required and explicitly enabled
+      ansible.builtin.reboot:
+        msg: Reboot initiated by the rolling Linux patch playbook
+        reboot_timeout: "{{ reboot_timeout_seconds }}"
+      when:
+        - reboot_required | bool
+        - reboot_after_patch | bool
+
+    - name: Refresh service facts after patching
+      ansible.builtin.service_facts:
+      when: verify_services | length > 0
+
+    - name: Verify required services are running
+      ansible.builtin.assert:
+        that:
+          - service_name in ansible_facts.services
+          - ansible_facts.services[service_name].state == 'running'
+        fail_msg: "Required service is not running: {{ service_name }}"
+      loop: "{{ verify_services }}"
+      loop_control:
+        loop_var: service_name
+      when: verify_services | length > 0
+
+  post_tasks:
+    - name: Capture post-patch boot identifier
+      ansible.builtin.command: cat /proc/sys/kernel/random/boot_id
+      register: boot_id_after
+      changed_when: false
+      check_mode: false
+
+    - name: Report patch outcome
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          packages_changed: >-
+            {{
+              (debian_patch.changed | default(false)) or
+              (redhat_patch.changed | default(false))
+            }}
+          reboot_required: "{{ reboot_required | bool }}"
+          reboot_performed: "{{ boot_id_before.stdout != boot_id_after.stdout }}"
+          verified_services: "{{ verify_services }}"
