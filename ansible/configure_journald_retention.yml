@@ -1,0 +1,121 @@
+---
+# Configure persistent systemd-journald storage and retention limits.
+#
+# Examples:
+#   ansible-playbook -i inventory configure_journald_retention.yml --check --diff
+#   ansible-playbook -i inventory configure_journald_retention.yml \
+#     -e journald_restart=true
+#   ansible-playbook -i inventory configure_journald_retention.yml \
+#     -e journald_system_max_use=2G \
+#     -e journald_max_retention_sec=14day \
+#     -e journald_restart=true
+#
+# Defaults are intentionally conservative. The configuration is installed as a
+# drop-in instead of modifying the distribution-managed journald.conf file.
+
+- name: Configure systemd journal retention
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    journald_system_max_use: "1G"
+    journald_runtime_max_use: "256M"
+    journald_max_file_sec: "1day"
+    journald_max_retention_sec: "30day"
+    journald_compress: true
+    journald_seal: true
+    journald_restart: false
+    journald_dropin_path: /etc/systemd/journald.conf.d/60-retention.conf
+
+  pre_tasks:
+    - name: Ensure the target uses systemd
+      ansible.builtin.assert:
+        that:
+          - ansible_service_mgr == "systemd"
+        fail_msg: >-
+          This playbook requires systemd; detected service manager:
+          {{ ansible_service_mgr | default('unknown') }}.
+
+    - name: Validate journal size values
+      ansible.builtin.assert:
+        that:
+          - journald_system_max_use is match('^[1-9][0-9]*[KMGTP]?$')
+          - journald_runtime_max_use is match('^[1-9][0-9]*[KMGTP]?$')
+        fail_msg: >-
+          Journal size values must be positive integers with an optional
+          K, M, G, T, or P suffix (examples: 512M or 2G).
+
+    - name: Validate journal duration values
+      ansible.builtin.assert:
+        that:
+          - journald_max_file_sec is match('^[1-9][0-9]*(us|ms|s|sec|min|h|hr|day|week|month|year)$')
+          - journald_max_retention_sec is match('^[1-9][0-9]*(us|ms|s|sec|min|h|hr|day|week|month|year)$')
+        fail_msg: >-
+          Journal durations must use a positive integer and a systemd time
+          unit, such as 12h, 7day, or 1month.
+
+    - name: Gather service information
+      ansible.builtin.service_facts:
+
+    - name: Ensure systemd-journald is available
+      ansible.builtin.assert:
+        that:
+          - "'systemd-journald.service' in ansible_facts.services"
+        fail_msg: systemd-journald.service was not found on the target.
+
+  tasks:
+    - name: Create journald drop-in directory
+      ansible.builtin.file:
+        path: "{{ journald_dropin_path | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install managed journal retention configuration
+      ansible.builtin.copy:
+        dest: "{{ journald_dropin_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+        content: |
+          # Managed by Ansible. Local changes will be replaced.
+          [Journal]
+          Storage=persistent
+          Compress={{ journald_compress | bool | ternary('yes', 'no') }}
+          Seal={{ journald_seal | bool | ternary('yes', 'no') }}
+          SystemMaxUse={{ journald_system_max_use }}
+          RuntimeMaxUse={{ journald_runtime_max_use }}
+          MaxFileSec={{ journald_max_file_sec }}
+          MaxRetentionSec={{ journald_max_retention_sec }}
+      notify: Restart systemd-journald when requested
+
+    - name: Apply pending handler before checking journal usage
+      ansible.builtin.meta: flush_handlers
+
+    - name: Read current journal disk usage
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --disk-usage
+      register: journald_disk_usage
+      changed_when: false
+      check_mode: false
+
+    - name: Report configuration and current usage
+      ansible.builtin.debug:
+        msg:
+          - "Drop-in: {{ journald_dropin_path }}"
+          - "SystemMaxUse: {{ journald_system_max_use }}"
+          - "MaxRetentionSec: {{ journald_max_retention_sec }}"
+          - "Restart requested: {{ journald_restart | bool }}"
+          - "{{ journald_disk_usage.stdout | default('Journal usage unavailable') }}"
+
+  handlers:
+    - name: Restart systemd-journald when requested
+      ansible.builtin.systemd_service:
+        name: systemd-journald.service
+        state: restarted
+      when: journald_restart | bool
