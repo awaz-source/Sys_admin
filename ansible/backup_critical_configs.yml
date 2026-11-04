@@ -1,0 +1,161 @@
+---
+# Create verified configuration archives and fetch them to the Ansible controller.
+#
+# Examples:
+#   ansible-playbook -i inventory backup_critical_configs.yml
+#   ansible-playbook -i inventory backup_critical_configs.yml \
+#     -e 'config_backup_paths=["/etc/ssh","/etc/fstab","/etc/firewalld"]' \
+#     -e config_backup_output_dir=./backups/change-1234
+#
+# Archives contain configuration data that may be sensitive. Store the controller
+# output directory securely. To inspect an archive without restoring it:
+#   tar -tzf config_backups/host-TIMESTAMP.tar.gz
+
+- name: Back up critical Linux configuration
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    config_backup_paths:
+      - /etc/fstab
+      - /etc/hosts
+      - /etc/resolv.conf
+      - /etc/ssh/sshd_config
+      - /etc/systemd/system
+    config_backup_output_dir: ./config_backups
+
+  pre_tasks:
+    - name: Explain check-mode limitation
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+        fail_msg: >-
+          This playbook must create and fetch an archive, so it cannot run in
+          check mode. Review config_backup_paths and run without --check.
+
+    - name: Validate backup path configuration
+      ansible.builtin.assert:
+        that:
+          - config_backup_paths is sequence
+          - config_backup_paths is not string
+          - config_backup_paths | length > 0
+          - item is string
+          - item is match('^/[^\n\r]*$')
+        fail_msg: >-
+          config_backup_paths must contain absolute Linux paths without newline
+          characters.
+      loop: "{{ config_backup_paths }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Verify tar is available on the managed host
+      ansible.builtin.command:
+        argv:
+          - /bin/sh
+          - -c
+          - command -v tar
+      changed_when: false
+
+    - name: Inspect requested paths
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop: "{{ config_backup_paths }}"
+      loop_control:
+        label: "{{ item }}"
+      register: config_backup_path_stats
+
+    - name: Build list of paths present on the managed host
+      ansible.builtin.set_fact:
+        config_backup_present_paths: >-
+          {{ config_backup_path_stats.results
+             | selectattr('stat.exists')
+             | map(attribute='item')
+             | list }}
+        config_backup_missing_paths: >-
+          {{ config_backup_path_stats.results
+             | rejectattr('stat.exists')
+             | map(attribute='item')
+             | list }}
+
+    - name: Require at least one existing backup path
+      ansible.builtin.assert:
+        that:
+          - config_backup_present_paths | length > 0
+        fail_msg: None of the requested backup paths exist on this host.
+
+  tasks:
+    - name: Create temporary working directory on managed host
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: ansible-config-backup-
+      register: config_backup_remote_temp
+
+    - name: Create, verify, and fetch configuration archive
+      block:
+        - name: Set archive names and paths
+          ansible.builtin.set_fact:
+            config_backup_safe_host: >-
+              {{ inventory_hostname | regex_replace('[^A-Za-z0-9_.-]', '_') }}
+            config_backup_archive_name: >-
+              {{ inventory_hostname | regex_replace('[^A-Za-z0-9_.-]', '_') }}-{{ ansible_date_time.iso8601_basic_short }}.tar.gz
+
+        - name: Create compressed configuration archive
+          ansible.builtin.command:
+            argv: >-
+              {{ ['tar', '--create', '--gzip', '--file',
+                  config_backup_remote_temp.path ~ '/' ~ config_backup_archive_name,
+                  '--'] + config_backup_present_paths }}
+          changed_when: true
+
+        - name: Restrict archive permissions
+          ansible.builtin.file:
+            path: "{{ config_backup_remote_temp.path }}/{{ config_backup_archive_name }}"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Calculate archive checksum
+          ansible.builtin.stat:
+            path: "{{ config_backup_remote_temp.path }}/{{ config_backup_archive_name }}"
+            checksum_algorithm: sha256
+          register: config_backup_archive_stat
+
+        - name: Create secure output directory on controller
+          ansible.builtin.file:
+            path: "{{ config_backup_output_dir }}"
+            state: directory
+            mode: "0700"
+          delegate_to: localhost
+          become: false
+
+        - name: Fetch archive to controller
+          ansible.builtin.fetch:
+            src: "{{ config_backup_remote_temp.path }}/{{ config_backup_archive_name }}"
+            dest: "{{ config_backup_output_dir }}/{{ config_backup_archive_name }}"
+            flat: true
+            validate_checksum: true
+
+        - name: Write SHA-256 sidecar on controller
+          ansible.builtin.copy:
+            dest: "{{ config_backup_output_dir }}/{{ config_backup_archive_name }}.sha256"
+            content: >-
+              {{ config_backup_archive_stat.stat.checksum }}  {{ config_backup_archive_name }}
+            mode: "0600"
+          delegate_to: localhost
+          become: false
+
+        - name: Report backup result
+          ansible.builtin.debug:
+            msg:
+              - "Archive: {{ config_backup_output_dir }}/{{ config_backup_archive_name }}"
+              - "SHA-256: {{ config_backup_archive_stat.stat.checksum }}"
+              - "Archived paths: {{ config_backup_present_paths | join(', ') }}"
+              - "Missing paths skipped: {{ config_backup_missing_paths | join(', ') | default('none', true) }}"
+
+      always:
+        - name: Remove remote temporary backup data
+          ansible.builtin.file:
+            path: "{{ config_backup_remote_temp.path }}"
+            state: absent
