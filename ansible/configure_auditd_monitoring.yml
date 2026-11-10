@@ -1,0 +1,194 @@
+---
+# Configure a practical Linux auditd monitoring baseline.
+#
+# Usage:
+#   ansible-playbook -i inventory configure_auditd_monitoring.yml --check --diff
+#   ansible-playbook -i inventory configure_auditd_monitoring.yml --become
+#   ansible-playbook -i inventory configure_auditd_monitoring.yml --become \
+#     -e auditd_apply_rules=false
+#
+# The playbook installs and enables auditd, then manages one dedicated rules
+# file. Existing rules owned by other files are preserved. Test in a staging
+# environment first because audit volume depends on host activity.
+
+- name: Configure auditd monitoring baseline
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    auditd_rules_file: /etc/audit/rules.d/50-managed-baseline.rules
+    auditd_apply_rules: true
+    auditd_monitor_systemd_units: true
+    auditd_monitor_cron: true
+    auditd_monitor_kernel_modules: true
+
+  pre_tasks:
+    - name: Validate supported operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_system == "Linux"
+          - ansible_os_family in ["RedHat", "Debian", "Suse"]
+        fail_msg: >-
+          This playbook supports Linux hosts in the RedHat, Debian, and Suse
+          operating-system families.
+
+    - name: Select distribution-specific audit package
+      ansible.builtin.set_fact:
+        auditd_package_name: "{{ 'audit' if ansible_os_family in ['RedHat', 'Suse'] else 'auditd' }}"
+        auditd_service_name: auditd
+
+  tasks:
+    - name: Install the audit daemon
+      ansible.builtin.package:
+        name: "{{ auditd_package_name }}"
+        state: present
+
+    - name: Ensure the audit rules directory exists
+      ansible.builtin.file:
+        path: /etc/audit/rules.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Inspect optional audit watch paths
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - /etc/security/opasswd
+        - /etc/sudoers
+        - /etc/sudoers.d
+        - /etc/ssh/sshd_config
+        - /etc/ssh/sshd_config.d
+        - /etc/crontab
+        - /etc/cron.d
+        - /var/spool/cron
+        - /var/spool/cron/crontabs
+        - /var/spool/cron/tabs
+      register: auditd_optional_path_checks
+
+    - name: Build the existing audit watch path list
+      ansible.builtin.set_fact:
+        auditd_existing_paths: >-
+          {{ auditd_optional_path_checks.results
+          | selectattr('stat.exists')
+          | map(attribute='item')
+          | list }}
+
+    - name: Deploy the managed audit monitoring baseline
+      ansible.builtin.copy:
+        dest: "{{ auditd_rules_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+        backup: true
+        content: |
+          ## Managed by Ansible: configure_auditd_monitoring.yml
+          ## Changes outside Ansible may be overwritten.
+
+          # Identity and authentication databases
+          -w /etc/passwd -p wa -k identity
+          -w /etc/group -p wa -k identity
+          -w /etc/shadow -p wa -k identity
+          -w /etc/gshadow -p wa -k identity
+          {% if '/etc/security/opasswd' in auditd_existing_paths %}
+          -w /etc/security/opasswd -p wa -k identity
+          {% endif %}
+
+          # Privilege delegation policy
+          {% if '/etc/sudoers' in auditd_existing_paths %}
+          -w /etc/sudoers -p wa -k privilege_scope
+          {% endif %}
+          {% if '/etc/sudoers.d' in auditd_existing_paths %}
+          -w /etc/sudoers.d/ -p wa -k privilege_scope
+          {% endif %}
+
+          # SSH server policy and authorized keys
+          {% if '/etc/ssh/sshd_config' in auditd_existing_paths %}
+          -w /etc/ssh/sshd_config -p wa -k ssh_config
+          {% endif %}
+          {% if '/etc/ssh/sshd_config.d' in auditd_existing_paths %}
+          -w /etc/ssh/sshd_config.d/ -p wa -k ssh_config
+          {% endif %}
+
+          {% if auditd_monitor_cron | bool %}
+          # Scheduled-task persistence locations
+          {% if '/etc/crontab' in auditd_existing_paths %}
+          -w /etc/crontab -p wa -k scheduled_tasks
+          {% endif %}
+          {% if '/etc/cron.d' in auditd_existing_paths %}
+          -w /etc/cron.d/ -p wa -k scheduled_tasks
+          {% endif %}
+          {% if '/var/spool/cron' in auditd_existing_paths %}
+          -w /var/spool/cron/ -p wa -k scheduled_tasks
+          {% endif %}
+          {% if '/var/spool/cron/crontabs' in auditd_existing_paths %}
+          -w /var/spool/cron/crontabs/ -p wa -k scheduled_tasks
+          {% endif %}
+          {% if '/var/spool/cron/tabs' in auditd_existing_paths %}
+          -w /var/spool/cron/tabs/ -p wa -k scheduled_tasks
+          {% endif %}
+          {% endif %}
+
+          {% if auditd_monitor_systemd_units | bool %}
+          # Locally managed systemd units and overrides
+          -w /etc/systemd/system/ -p wa -k systemd_units
+          {% endif %}
+
+          # Audit policy changes
+          -w /etc/audit/ -p wa -k audit_config
+
+          # System clock changes by non-system users
+          -a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -F auid>=1000 -F auid!=unset -k time_change
+          {% if ansible_architecture in ['x86_64', 'i386', 'i686'] %}
+          -a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -F auid>=1000 -F auid!=unset -k time_change
+          {% endif %}
+
+          {% if auditd_monitor_kernel_modules | bool %}
+          # Kernel module operations by interactive users
+          -a always,exit -F arch=b64 -S init_module,finit_module,delete_module -F auid>=1000 -F auid!=unset -k kernel_modules
+          {% if ansible_architecture in ['x86_64', 'i386', 'i686'] %}
+          -a always,exit -F arch=b32 -S init_module,delete_module -F auid>=1000 -F auid!=unset -k kernel_modules
+          {% endif %}
+          {% endif %}
+      notify: Load managed audit rules
+
+    - name: Ensure auditd is enabled and running
+      ansible.builtin.service:
+        name: "{{ auditd_service_name }}"
+        enabled: true
+        state: started
+
+    - name: Flush handlers so new rules can be verified
+      ansible.builtin.meta: flush_handlers
+
+    - name: List loaded managed audit keys
+      ansible.builtin.command:
+        cmd: auditctl -l
+      register: auditd_loaded_rules
+      changed_when: false
+      failed_when: false
+      when:
+        - not ansible_check_mode
+        - auditd_apply_rules | bool
+
+    - name: Report managed audit keys found after loading
+      ansible.builtin.debug:
+        msg: >-
+          Loaded managed keys: {{ auditd_loaded_rules.stdout_lines
+          | select('search', '-k (identity|privilege_scope|ssh_config|scheduled_tasks|systemd_units|audit_config|time_change|kernel_modules)')
+          | list | length }} rule lines. Review with: auditctl -l
+      when:
+        - not ansible_check_mode
+        - auditd_apply_rules | bool
+
+  handlers:
+    - name: Load managed audit rules
+      ansible.builtin.command:
+        cmd: augenrules --load
+      changed_when: true
+      when:
+        - auditd_apply_rules | bool
+        - not ansible_check_mode
