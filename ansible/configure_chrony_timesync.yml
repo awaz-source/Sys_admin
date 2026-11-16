@@ -1,0 +1,132 @@
+---
+# Install and configure Chrony time synchronization on Debian- and Red Hat-family Linux.
+#
+# Usage:
+#   ansible-playbook -i inventory configure_chrony_timesync.yml --syntax-check
+#   ansible-playbook -i inventory configure_chrony_timesync.yml --limit test_hosts
+#   # Check mode is supported when Chrony is already installed on the target:
+#   ansible-playbook -i inventory configure_chrony_timesync.yml --check --diff
+#   ansible-playbook -i inventory configure_chrony_timesync.yml \
+#     -e '{"chrony_ntp_sources":[{"type":"server","name":"ntp1.example.com","options":"iburst"}]}'
+#
+# The managed block adds approved sources without deleting distribution defaults. Override
+# chrony_ntp_sources for internal NTP servers. Test against a limited inventory first.
+
+- name: Configure reliable time synchronization with Chrony
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    chrony_ntp_sources:
+      - type: pool
+        name: pool.ntp.org
+        options: iburst
+    chrony_makestep_threshold: 1.0
+    chrony_makestep_updates: 3
+    chrony_enable_rtcsync: true
+
+  pre_tasks:
+    - name: Confirm the operating system is supported
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family in ['Debian', 'RedHat']
+        fail_msg: >-
+          This playbook supports Debian- and Red Hat-family systems; detected
+          {{ ansible_facts.os_family | default('unknown') }}.
+
+    - name: Validate Chrony source variables
+      ansible.builtin.assert:
+        that:
+          - chrony_ntp_sources | length > 0
+          - item.type in ['server', 'pool', 'peer']
+          - item.name is string
+          - item.name | length > 0
+          - item.options | default('') is string
+        fail_msg: >-
+          Each chrony_ntp_sources entry requires a non-empty name, an optional
+          string of options, and type server, pool, or peer.
+      loop: "{{ chrony_ntp_sources }}"
+      loop_control:
+        label: "{{ item.name | default('invalid source') }}"
+
+  tasks:
+    - name: Set platform-specific Chrony paths and service name
+      ansible.builtin.set_fact:
+        chrony_config_path: >-
+          {{ '/etc/chrony/chrony.conf'
+             if ansible_facts.os_family == 'Debian'
+             else '/etc/chrony.conf' }}
+        chrony_service_name: >-
+          {{ 'chrony'
+             if ansible_facts.os_family == 'Debian'
+             else 'chronyd' }}
+
+    - name: Install Chrony
+      ansible.builtin.package:
+        name: chrony
+        state: present
+
+    - name: Check for the Chrony configuration file
+      ansible.builtin.stat:
+        path: "{{ chrony_config_path }}"
+      register: chrony_config
+
+    - name: Stop when the expected Chrony configuration is unavailable
+      ansible.builtin.assert:
+        that:
+          - chrony_config.stat.exists
+          - chrony_config.stat.isreg
+        fail_msg: "Expected Chrony configuration was not found: {{ chrony_config_path }}"
+
+    - name: Add managed time sources and clock correction settings
+      ansible.builtin.blockinfile:
+        path: "{{ chrony_config_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        marker: "# {mark} ANSIBLE MANAGED TIME SOURCES"
+        block: |
+          {% for source in chrony_ntp_sources %}
+          {{ source.type }} {{ source.name }} {{ source.options | default('') }}
+          {% endfor %}
+          makestep {{ chrony_makestep_threshold }} {{ chrony_makestep_updates }}
+          {% if chrony_enable_rtcsync | bool %}
+          rtcsync
+          {% endif %}
+        validate: "chronyd -p -f %s"
+      notify: Restart Chrony
+
+    - name: Enable and start Chrony
+      ansible.builtin.service:
+        name: "{{ chrony_service_name }}"
+        enabled: true
+        state: started
+
+    - name: Apply pending Chrony configuration changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Query Chrony tracking status
+      ansible.builtin.command:
+        argv:
+          - chronyc
+          - -n
+          - tracking
+      register: chrony_tracking
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Display Chrony tracking status
+      ansible.builtin.debug:
+        msg: >-
+          {{ chrony_tracking.stdout
+             if chrony_tracking.rc == 0
+             else 'Chrony is installed, but tracking data is not yet available: '
+                  ~ chrony_tracking.stderr | default('no detail') }}
+
+  handlers:
+    - name: Restart Chrony
+      ansible.builtin.service:
+        name: "{{ chrony_service_name }}"
+        state: restarted
