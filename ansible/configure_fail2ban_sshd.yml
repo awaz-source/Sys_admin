@@ -1,0 +1,163 @@
+---
+# Install Fail2ban and manage an SSH jail on Debian- and Red Hat-family Linux.
+#
+# Usage:
+#   ansible-playbook -i inventory configure_fail2ban_sshd.yml --syntax-check
+#   ansible-playbook -i inventory configure_fail2ban_sshd.yml --limit test_hosts --check --diff
+#   ansible-playbook -i inventory configure_fail2ban_sshd.yml --limit test_hosts
+#   ansible-playbook -i inventory configure_fail2ban_sshd.yml \
+#     -e '{"fail2ban_ignore_ips":["127.0.0.1/8","::1","10.20.0.0/16"]}'
+#
+# Add every approved management network to fail2ban_ignore_ips before rollout.
+# On Red Hat-family hosts, ensure an enabled repository provides the fail2ban package.
+
+- name: Configure Fail2ban protection for SSH
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    fail2ban_sshd_enabled: true
+    fail2ban_sshd_port: ssh
+    fail2ban_sshd_backend: systemd
+    fail2ban_bantime_seconds: 3600
+    fail2ban_findtime_seconds: 600
+    fail2ban_maxretry: 5
+    fail2ban_ignore_ips:
+      - 127.0.0.1/8
+      - ::1
+    fail2ban_sshd_jail_path: /etc/fail2ban/jail.d/sshd.local
+
+  pre_tasks:
+    - name: Confirm the operating system is supported
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family in ['Debian', 'RedHat']
+        fail_msg: >-
+          This playbook supports Debian- and Red Hat-family systems; detected
+          {{ ansible_facts.os_family | default('unknown') }}.
+
+    - name: Validate Fail2ban policy variables
+      ansible.builtin.assert:
+        that:
+          - fail2ban_bantime_seconds | int >= 60
+          - fail2ban_findtime_seconds | int >= 60
+          - fail2ban_maxretry | int >= 1
+          - fail2ban_maxretry | int <= 20
+          - fail2ban_ignore_ips is iterable
+          - fail2ban_ignore_ips | length > 0
+          - fail2ban_sshd_port | string | length > 0
+          - fail2ban_sshd_backend | string | length > 0
+        fail_msg: >-
+          Use bantime/findtime values of at least 60 seconds, maxretry from 1
+          through 20, a port/backend value, and at least one ignored address.
+
+  tasks:
+    - name: Install Fail2ban
+      ansible.builtin.package:
+        name: fail2ban
+        state: present
+
+    - name: Ensure the jail override directory exists
+      ansible.builtin.file:
+        path: /etc/fail2ban/jail.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check whether an SSH jail override already exists
+      ansible.builtin.stat:
+        path: "{{ fail2ban_sshd_jail_path }}"
+      register: fail2ban_previous_jail
+
+    - name: Deploy and validate the managed SSH jail
+      block:
+        - name: Write the managed SSH jail
+          ansible.builtin.copy:
+            dest: "{{ fail2ban_sshd_jail_path }}"
+            owner: root
+            group: root
+            mode: "0644"
+            backup: true
+            content: |
+              # Managed by Ansible. Add management networks to ignoreip before rollout.
+              [sshd]
+              enabled = {{ fail2ban_sshd_enabled | bool | lower }}
+              port = {{ fail2ban_sshd_port }}
+              backend = {{ fail2ban_sshd_backend }}
+              bantime = {{ fail2ban_bantime_seconds }}
+              findtime = {{ fail2ban_findtime_seconds }}
+              maxretry = {{ fail2ban_maxretry }}
+              ignoreip = {{ fail2ban_ignore_ips | join(' ') }}
+          register: fail2ban_jail_deployment
+          notify: Restart Fail2ban
+
+        - name: Validate the complete Fail2ban configuration
+          ansible.builtin.command:
+            argv:
+              - fail2ban-client
+              - -t
+          changed_when: false
+          when: not ansible_check_mode
+
+      rescue:
+        - name: Restore the previous SSH jail from the Ansible backup
+          ansible.builtin.copy:
+            src: "{{ fail2ban_jail_deployment.backup_file }}"
+            dest: "{{ fail2ban_sshd_jail_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0644"
+          when:
+            - fail2ban_previous_jail.stat.exists
+            - fail2ban_jail_deployment is defined
+            - fail2ban_jail_deployment.backup_file is defined
+
+        - name: Remove an invalid first-time SSH jail
+          ansible.builtin.file:
+            path: "{{ fail2ban_sshd_jail_path }}"
+            state: absent
+          when: not fail2ban_previous_jail.stat.exists
+
+        - name: Stop after restoring the prior configuration
+          ansible.builtin.fail:
+            msg: >-
+              Fail2ban validation failed. The previous SSH jail was restored,
+              or the invalid first-time file was removed. Review the validation output.
+
+    - name: Enable and start Fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    - name: Apply validated Fail2ban changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Query the SSH jail status
+      ansible.builtin.command:
+        argv:
+          - fail2ban-client
+          - status
+          - sshd
+      register: fail2ban_sshd_status
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Display the SSH jail status
+      ansible.builtin.debug:
+        msg: >-
+          {{ fail2ban_sshd_status.stdout
+             if fail2ban_sshd_status.rc | default(1) == 0
+             else 'SSH jail status is not yet available: '
+                  ~ fail2ban_sshd_status.stderr | default('no detail') }}
+      when: not ansible_check_mode
+
+  handlers:
+    - name: Restart Fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
