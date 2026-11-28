@@ -1,0 +1,105 @@
+---
+# Configure conservative Linux network-stack hardening with sysctl.
+#
+# Usage:
+#   ansible-playbook -i inventory ansible/configure_network_sysctl_hardening.yml
+#
+# Preview changes:
+#   ansible-playbook -i inventory ansible/configure_network_sysctl_hardening.yml --check --diff
+#
+# Override or extend settings from inventory/group_vars:
+#   network_sysctl_hardening:
+#     net.ipv4.tcp_syncookies: 1
+#     net.ipv4.conf.all.accept_redirects: 0
+#
+# Important: review overrides for routers, asymmetric-routing hosts, and other
+# specialized network appliances before deployment. This playbook deliberately
+# does not change IP forwarding or reverse-path filtering.
+
+- name: Configure Linux network sysctl hardening
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    network_sysctl_config_path: /etc/sysctl.d/60-network-hardening.conf
+    network_sysctl_reload: true
+    network_sysctl_hardening:
+      net.ipv4.conf.all.accept_redirects: 0
+      net.ipv4.conf.default.accept_redirects: 0
+      net.ipv4.conf.all.secure_redirects: 0
+      net.ipv4.conf.default.secure_redirects: 0
+      net.ipv4.conf.all.send_redirects: 0
+      net.ipv4.conf.default.send_redirects: 0
+      net.ipv4.conf.all.accept_source_route: 0
+      net.ipv4.conf.default.accept_source_route: 0
+      net.ipv4.conf.all.log_martians: 1
+      net.ipv4.conf.default.log_martians: 1
+      net.ipv4.icmp_echo_ignore_broadcasts: 1
+      net.ipv4.icmp_ignore_bogus_error_responses: 1
+      net.ipv4.tcp_syncookies: 1
+      net.ipv6.conf.all.accept_redirects: 0
+      net.ipv6.conf.default.accept_redirects: 0
+      net.ipv6.conf.all.accept_source_route: 0
+      net.ipv6.conf.default.accept_source_route: 0
+
+  pre_tasks:
+    - name: Confirm this play is running on Linux
+      ansible.builtin.assert:
+        that:
+          - ansible_system == "Linux"
+        fail_msg: This playbook supports Linux hosts only.
+
+    - name: Confirm the hardening map is not empty
+      ansible.builtin.assert:
+        that:
+          - network_sysctl_hardening is mapping
+          - network_sysctl_hardening | length > 0
+        fail_msg: network_sysctl_hardening must be a non-empty mapping.
+
+    - name: Check that the sysctl command is available
+      ansible.builtin.command: sysctl --version
+      register: network_sysctl_command
+      changed_when: false
+      check_mode: false
+
+  tasks:
+    - name: Install the managed network hardening configuration
+      ansible.builtin.copy:
+        dest: "{{ network_sysctl_config_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+        content: |
+          # Managed by Ansible: configure_network_sysctl_hardening.yml
+          # Review changes for specialized routing hosts before deployment.
+          {% for setting in network_sysctl_hardening | dictsort %}
+          {{ setting.0 }} = {{ setting.1 }}
+          {% endfor %}
+      notify: Reload sysctl settings
+
+    - name: Read the deployed configuration
+      ansible.builtin.slurp:
+        src: "{{ network_sysctl_config_path }}"
+      register: network_sysctl_deployed
+      when: not ansible_check_mode
+
+    - name: Confirm every requested setting was rendered
+      ansible.builtin.assert:
+        that:
+          - >-
+            (setting.key ~ ' = ' ~ (setting.value | string))
+            in (network_sysctl_deployed.content | b64decode)
+        fail_msg: "The deployed file is missing {{ setting.key }} = {{ setting.value }}"
+      loop: "{{ network_sysctl_hardening | dict2items }}"
+      loop_control:
+        loop_var: setting
+        label: "{{ setting.key }}"
+      when: not ansible_check_mode
+
+  handlers:
+    - name: Reload sysctl settings
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+      when: network_sysctl_reload | bool
